@@ -109,7 +109,8 @@ def encode_gsm7(text: str) -> bytes:
     return bytes(packed)
 
 
-def create_sms_deliver_pdu(sender: str, text: str, encoding: int = SMSEncoding.GSM7) -> bytes:
+def create_sms_deliver_pdu(sender: str, text: str, encoding: int = SMSEncoding.GSM7,
+                           request_status_report: bool = False) -> bytes:
     """
     Create an SMS-DELIVER PDU (for mobile-terminated SMS)
 
@@ -117,6 +118,7 @@ def create_sms_deliver_pdu(sender: str, text: str, encoding: int = SMSEncoding.G
         sender: Sender phone number (e.g., "+1234567890")
         text: SMS text content
         encoding: Text encoding (GSM7, 8BIT, or UCS2)
+        request_status_report: If True, request delivery report from UE (TP-SRI=1)
 
     Returns:
         Complete SMS-DELIVER TPDU
@@ -125,10 +127,13 @@ def create_sms_deliver_pdu(sender: str, text: str, encoding: int = SMSEncoding.G
 
     # TP-MTI (Message Type Indicator): SMS-DELIVER = 0x00
     # TP-MMS (More Messages to Send): 0 (no more messages)
-    # TP-SRI (Status Report Indication): 0
+    # TP-SRI (Status Report Indication): bit 5
     # TP-UDHI (User Data Header Indicator): 0
     # TP-RP (Reply Path): 0
-    pdu.append(0x00)
+    first_byte = 0x00
+    if request_status_report:
+        first_byte |= 0x20  # Set bit 5 (TP-SRI)
+    pdu.append(first_byte)
 
     # TP-OA (Originating Address)
     pdu.extend(encode_address(sender))
@@ -159,7 +164,8 @@ def create_sms_deliver_pdu(sender: str, text: str, encoding: int = SMSEncoding.G
     return bytes(pdu)
 
 
-def create_rp_data_dl(destination: str, tpdu: bytes, reference: int = 0) -> bytes:
+def create_rp_data_dl(destination: str, tpdu: bytes, reference: int = 0, smsc_address: str = "+0000",
+                      include_destination: bool = True) -> bytes:
     """
     Create RP-DATA message (downlink) - wraps SMS TPDU for NAS transport
 
@@ -167,6 +173,8 @@ def create_rp_data_dl(destination: str, tpdu: bytes, reference: int = 0) -> byte
         destination: Destination MSISDN
         tpdu: SMS TPDU (from create_sms_deliver_pdu)
         reference: RP message reference (0-255)
+        smsc_address: SMSC service center address (default: +0000)
+        include_destination: Include RP-Destination Address (default: True)
 
     Returns:
         Complete RP-DATA message for NAS container
@@ -179,13 +187,26 @@ def create_rp_data_dl(destination: str, tpdu: bytes, reference: int = 0) -> byte
     # RP-Message Reference
     rp_data.append(reference & 0xFF)
 
-    # RP-Originator Address (SMSC address) - empty for MT
-    rp_data.append(0x00)
+    # RP-Originator Address (SMSC address) - MANDATORY for MT-SMS
+    # encode_address returns [digit_count, type, bcd_digits...]
+    # But RP address needs [byte_count, type, bcd_digits...]
+    # So we skip the first byte and use length of remainder
+    smsc_addr_full = encode_address(smsc_address)
+    smsc_addr_value = smsc_addr_full[1:]  # Skip digit count, keep [type, bcd_digits...]
+    rp_data.append(len(smsc_addr_value))  # Length in bytes
+    rp_data.extend(smsc_addr_value)
 
-    # RP-Destination Address (destination number)
-    dest_addr = encode_address(destination)
-    rp_data.append(len(dest_addr))
-    rp_data.extend(dest_addr)
+    # RP-Destination Address (destination MSISDN)
+    # For MT-SMS, some implementations expect this to be absent (length 0)
+    # since routing is done via IMSI in SGsAP layer
+    if include_destination and destination:
+        dest_addr_full = encode_address(destination)
+        dest_addr_value = dest_addr_full[1:]  # Skip digit count, keep [type, bcd_digits...]
+        rp_data.append(len(dest_addr_value))  # Length in bytes
+        rp_data.extend(dest_addr_value)
+    else:
+        # RP-Destination Address absent (length 0)
+        rp_data.append(0x00)
 
     # RP-User Data (contains the TPDU)
     rp_data.append(len(tpdu))
@@ -219,3 +240,27 @@ def create_cp_data(rp_message: bytes, ti: int = 0) -> bytes:
     cp_data.extend(rp_message)
 
     return bytes(cp_data)
+
+
+def create_cp_ack(ti: int = 0) -> bytes:
+    """
+    Create CP-ACK message - acknowledges CP-DATA receipt
+
+    Args:
+        ti: Transaction Identifier (must match the CP-DATA being acknowledged)
+            TI flag should be set to 1 (responding to peer-allocated TI)
+
+    Returns:
+        Complete CP-ACK message (NAS message)
+    """
+    cp_ack = bytearray()
+
+    # Protocol Discriminator: SMS (0x09) + Transaction ID with TI flag = 1
+    # TI flag (bit 4) = 1 means responding to peer-allocated TI
+    pd_ti = 0x09 | ((ti & 0x07) << 4) | 0x08
+    cp_ack.append(pd_ti)
+
+    # Message Type: CP-ACK = 0x04
+    cp_ack.append(0x04)
+
+    return bytes(cp_ack)
