@@ -4,6 +4,7 @@ REST API for Mini SMSC
 Provides HTTP endpoints to send SMS via Open5GS
 """
 
+import os
 import logging
 import threading
 from flask import Flask, request, jsonify
@@ -203,16 +204,21 @@ def main():
     import argparse
 
     parser = argparse.ArgumentParser(description='Mini SMSC REST API')
-    parser.add_argument('--mme-address', default='127.0.0.1',
-                       help='MME IP address (default: 127.0.0.1)')
-    parser.add_argument('--mme-port', type=int, default=29118,
-                       help='MME SGs port (default: 29118)')
-    parser.add_argument('--vlr-name', default='vlr.open5gs.org',
-                       help='VLR/MSC FQDN (default: vlr.open5gs.org)')
-    parser.add_argument('--api-host', default='0.0.0.0',
-                       help='API host (default: 0.0.0.0)')
-    parser.add_argument('--api-port', type=int, default=8080,
-                       help='API port (default: 8080)')
+    parser.add_argument('--mme-address',
+                       default=os.getenv('MME_ADDRESS', '127.0.0.1'),
+                       help='MME IP address (env: MME_ADDRESS, default: 127.0.0.1)')
+    parser.add_argument('--mme-port', type=int,
+                       default=int(os.getenv('MME_PORT', '29118')),
+                       help='MME SGs port (env: MME_PORT, default: 29118)')
+    parser.add_argument('--vlr-name',
+                       default=os.getenv('VLR_NAME', 'vlr.open5gs.org'),
+                       help='VLR/MSC FQDN (env: VLR_NAME, default: vlr.open5gs.org)')
+    parser.add_argument('--api-host',
+                       default=os.getenv('API_HOST', '0.0.0.0'),
+                       help='API host (env: API_HOST, default: 0.0.0.0)')
+    parser.add_argument('--api-port', type=int,
+                       default=int(os.getenv('API_PORT', '8080')),
+                       help='API port (env: API_PORT, default: 8080)')
 
     args = parser.parse_args()
 
