@@ -1,0 +1,11 @@
+# Python SMSC Requirements
+
+# REST API
+flask>=2.3.0
+
+# SCTP support (optional - will fallback to TCP if not available)
+# pysctp
+
+# For production use, consider adding:
+# redis  # For message queue persistence
+# gunicorn  # Production WSGI server
