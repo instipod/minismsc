@@ -7,7 +7,10 @@ Provides HTTP endpoints to send SMS via Open5GS
 import os
 import logging
 import threading
-from flask import Flask, request, jsonify
+from typing import Optional, List
+from fastapi import FastAPI, HTTPException, status
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field, field_validator
 from smsc import SMSCService
 
 logging.basicConfig(
@@ -16,191 +19,217 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-app = Flask(__name__)
+app = FastAPI(
+    title="Mini SMSC API",
+    description="REST API for sending SMS via Open5GS",
+    version="1.0.0"
+)
 smsc_service: SMSCService = None
 
 
-@app.route('/health', methods=['GET'])
-def health():
+# Pydantic models
+class SMSRequest(BaseModel):
+    imsi: str = Field(..., description="Subscriber IMSI (14-15 digits)")
+    msisdn: Optional[str] = Field(None, description="Subscriber phone number (defaults to IMSI)")
+    sender: str = Field("SMSC", description="Sender address/short code")
+    text: str = Field(..., description="SMS text content (max 160 characters)")
+    request_delivery_report: bool = Field(False, description="Request delivery confirmation")
+
+    @field_validator('imsi')
+    @classmethod
+    def validate_imsi(cls, v: str) -> str:
+        if not v.isdigit() or len(v) < 14 or len(v) > 15:
+            raise ValueError('IMSI must be 14-15 digits')
+        return v
+
+    @field_validator('text')
+    @classmethod
+    def validate_text(cls, v: str) -> str:
+        if len(v) > 160:
+            raise ValueError('Text must not exceed 160 characters')
+        return v
+
+
+class BulkSMSRequest(BaseModel):
+    messages: List[SMSRequest] = Field(..., description="List of SMS messages to send")
+
+    @field_validator('messages')
+    @classmethod
+    def validate_messages_length(cls, v: List[SMSRequest]) -> List[SMSRequest]:
+        if len(v) > 100:
+            raise ValueError('Maximum 100 messages per bulk request')
+        return v
+
+
+class HealthResponse(BaseModel):
+    status: str
+    service: str
+    connected: bool
+
+
+class LAIInfo(BaseModel):
+    mcc: str
+    mnc: str
+    lac: int
+
+
+class StatusResponse(BaseModel):
+    connected: bool
+    listen_address: str
+    listen_port: int
+    vlr_name: str
+    smsc_address: str
+    lai: LAIInfo
+    queue_length: int
+
+
+class SMSDetails(BaseModel):
+    imsi: str
+    msisdn: str
+    sender: str
+    text_length: int
+    request_delivery_report: bool
+
+
+class SMSResponse(BaseModel):
+    status: str
+    message: str
+    details: SMSDetails
+
+
+class BulkError(BaseModel):
+    index: int
+    imsi: Optional[str] = None
+    error: str
+
+
+class BulkSMSResponse(BaseModel):
+    queued: int
+    failed: int
+    errors: List[BulkError]
+
+
+# Endpoints
+@app.get('/health', response_model=HealthResponse)
+async def health():
     """Health check endpoint"""
-    return jsonify({
-        'status': 'healthy',
-        'service': 'mini-smsc',
-        'connected': smsc_service.connected if smsc_service else False
-    }), 200
+    return HealthResponse(
+        status='healthy',
+        service='mini-smsc',
+        connected=smsc_service.connected if smsc_service else False
+    )
 
 
-@app.route('/api/status', methods=['GET'])
-def status():
+@app.get('/api/status', response_model=StatusResponse)
+async def get_status():
     """Get SMSC service status"""
     if not smsc_service:
-        return jsonify({'error': 'SMSC service not initialized'}), 503
-
-    return jsonify({
-        'connected': smsc_service.connected,
-        'listen_address': smsc_service.listen_address,
-        'listen_port': smsc_service.listen_port,
-        'vlr_name': smsc_service.vlr_name,
-        'smsc_address': smsc_service.smsc_address,
-        'lai': {
-            'mcc': smsc_service.lai_mcc,
-            'mnc': smsc_service.lai_mnc,
-            'lac': smsc_service.lai_lac
-        },
-        'queue_length': len(smsc_service.message_queue)
-    }), 200
-
-
-@app.route('/api/sms/send', methods=['POST'])
-def send_sms():
-    """
-    Send SMS to a subscriber
-
-    Request body:
-    {
-        "imsi": "001010000000001",
-        "msisdn": "+1234567890",
-        "sender": "+9999",
-        "text": "Hello from SMSC!",
-        "request_delivery_report": false
-    }
-
-    Optional fields:
-    - msisdn: defaults to imsi if not provided
-    - sender: defaults to "SMSC" if not provided
-    - request_delivery_report: request delivery confirmation (default: false)
-    """
-    if not smsc_service:
-        return jsonify({'error': 'SMSC service not initialized'}), 503
-
-    if not smsc_service.connected:
-        return jsonify({'error': 'SMSC not connected to MME'}), 503
-
-    # Parse request
-    data = request.get_json()
-    if not data:
-        return jsonify({'error': 'Invalid JSON'}), 400
-
-    # Validate required fields
-    imsi = data.get('imsi')
-    text = data.get('text')
-
-    if not imsi:
-        return jsonify({'error': 'Missing required field: imsi'}), 400
-    if not text:
-        return jsonify({'error': 'Missing required field: text'}), 400
-
-    # Optional fields
-    msisdn = data.get('msisdn', imsi)  # Default to IMSI if not provided
-    sender = data.get('sender', 'SMSC')  # Default sender
-    request_delivery_report = data.get('request_delivery_report', False)
-
-    # Validate IMSI format (should be digits, 14-15 length)
-    if not imsi.isdigit() or len(imsi) < 14 or len(imsi) > 15:
-        return jsonify({'error': 'Invalid IMSI format'}), 400
-
-    # Validate text length (160 chars for GSM7, 70 for UCS2)
-    if len(text) > 160:
-        return jsonify({'error': 'Text too long (max 160 characters)'}), 400
-
-    try:
-        # Queue SMS for sending
-        smsc_service.send_sms(
-            imsi=imsi,
-            msisdn=msisdn,
-            sender=sender,
-            text=text,
-            request_delivery_report=request_delivery_report
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail='SMSC service not initialized'
         )
 
-        logger.info(f"API: SMS queued for {imsi}")
+    return StatusResponse(
+        connected=smsc_service.connected,
+        listen_address=smsc_service.listen_address,
+        listen_port=smsc_service.listen_port,
+        vlr_name=smsc_service.vlr_name,
+        smsc_address=smsc_service.smsc_address,
+        lai=LAIInfo(
+            mcc=smsc_service.lai_mcc,
+            mnc=smsc_service.lai_mnc,
+            lac=smsc_service.lai_lac
+        ),
+        queue_length=len(smsc_service.message_queue)
+    )
 
-        return jsonify({
-            'status': 'queued',
-            'message': 'SMS queued for delivery',
-            'details': {
-                'imsi': imsi,
-                'msisdn': msisdn,
-                'sender': sender,
-                'text_length': len(text),
-                'request_delivery_report': request_delivery_report
-            }
-        }), 202  # 202 Accepted
+
+@app.post('/api/sms/send', response_model=SMSResponse, status_code=status.HTTP_202_ACCEPTED)
+async def send_sms(sms: SMSRequest):
+    """Send SMS to a subscriber"""
+    if not smsc_service:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail='SMSC service not initialized'
+        )
+
+    if not smsc_service.connected:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail='SMSC not connected to MME'
+        )
+
+    msisdn = sms.msisdn or sms.imsi
+
+    try:
+        smsc_service.send_sms(
+            imsi=sms.imsi,
+            msisdn=msisdn,
+            sender=sms.sender,
+            text=sms.text,
+            request_delivery_report=sms.request_delivery_report
+        )
+
+        logger.info(f"API: SMS queued for {sms.imsi}")
+
+        return SMSResponse(
+            status='queued',
+            message='SMS queued for delivery',
+            details=SMSDetails(
+                imsi=sms.imsi,
+                msisdn=msisdn,
+                sender=sms.sender,
+                text_length=len(sms.text),
+                request_delivery_report=sms.request_delivery_report
+            )
+        )
 
     except Exception as e:
         logger.error(f"API: Error queuing SMS: {e}")
-        return jsonify({'error': str(e)}), 500
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(e)
+        )
 
 
-@app.route('/api/sms/send/bulk', methods=['POST'])
-def send_bulk_sms():
-    """
-    Send SMS to multiple subscribers
-
-    Request body:
-    {
-        "messages": [
-            {
-                "imsi": "001010000000001",
-                "msisdn": "+1234567890",
-                "sender": "+9999",
-                "text": "Hello!"
-            },
-            ...
-        ]
-    }
-    """
+@app.post('/api/sms/send/bulk', response_model=BulkSMSResponse, status_code=status.HTTP_202_ACCEPTED)
+async def send_bulk_sms(request: BulkSMSRequest):
+    """Send SMS to multiple subscribers"""
     if not smsc_service:
-        return jsonify({'error': 'SMSC service not initialized'}), 503
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail='SMSC service not initialized'
+        )
 
     if not smsc_service.connected:
-        return jsonify({'error': 'SMSC not connected to MME'}), 503
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail='SMSC not connected to MME'
+        )
 
-    data = request.get_json()
-    if not data or 'messages' not in data:
-        return jsonify({'error': 'Missing messages array'}), 400
+    results = BulkSMSResponse(queued=0, failed=0, errors=[])
 
-    messages = data['messages']
-    if not isinstance(messages, list):
-        return jsonify({'error': 'messages must be an array'}), 400
-
-    if len(messages) > 100:
-        return jsonify({'error': 'Maximum 100 messages per bulk request'}), 400
-
-    results = {
-        'queued': 0,
-        'failed': 0,
-        'errors': []
-    }
-
-    for idx, msg in enumerate(messages):
-        imsi = msg.get('imsi')
-        text = msg.get('text')
-
-        if not imsi or not text:
-            results['failed'] += 1
-            results['errors'].append({
-                'index': idx,
-                'error': 'Missing imsi or text'
-            })
-            continue
-
-        msisdn = msg.get('msisdn', imsi)
-        sender = msg.get('sender', 'SMSC')
-        request_delivery_report = msg.get('request_delivery_report', False)
+    for idx, msg in enumerate(request.messages):
+        msisdn = msg.msisdn or msg.imsi
 
         try:
-            smsc_service.send_sms(imsi, msisdn, sender, text, request_delivery_report)
-            results['queued'] += 1
+            smsc_service.send_sms(
+                msg.imsi,
+                msisdn,
+                msg.sender,
+                msg.text,
+                msg.request_delivery_report
+            )
+            results.queued += 1
         except Exception as e:
-            results['failed'] += 1
-            results['errors'].append({
-                'index': idx,
-                'imsi': imsi,
-                'error': str(e)
-            })
+            results.failed += 1
+            results.errors.append(BulkError(
+                index=idx,
+                imsi=msg.imsi,
+                error=str(e)
+            ))
 
-    return jsonify(results), 202
+    return results
 
 
 def run_smsc_background(smsc: SMSCService):
@@ -214,6 +243,7 @@ def run_smsc_background(smsc: SMSCService):
 def main():
     """Main entry point"""
     import argparse
+    import uvicorn
 
     parser = argparse.ArgumentParser(description='Mini SMSC/VLR REST API')
     parser.add_argument('--listen-address',
@@ -271,15 +301,16 @@ def main():
         )
         smsc_thread.start()
 
-        # Start Flask API
+        # Start FastAPI with uvicorn
         logger.info(f"Starting REST API on {args.api_host}:{args.api_port}")
         logger.info("\nAPI Endpoints:")
         logger.info(f"  GET  http://{args.api_host}:{args.api_port}/health")
         logger.info(f"  GET  http://{args.api_host}:{args.api_port}/api/status")
         logger.info(f"  POST http://{args.api_host}:{args.api_port}/api/sms/send")
         logger.info(f"  POST http://{args.api_host}:{args.api_port}/api/sms/send/bulk")
+        logger.info(f"  Docs: http://{args.api_host}:{args.api_port}/docs")
 
-        app.run(host=args.api_host, port=args.api_port, debug=False)
+        uvicorn.run(app, host=args.api_host, port=args.api_port, log_level="info")
 
     except KeyboardInterrupt:
         logger.info("\nShutting down...")
