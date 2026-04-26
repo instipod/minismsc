@@ -1,11 +1,12 @@
 # Python SMSC Requirements
 
 # REST API
-flask>=2.3.0
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+pydantic>=2.0.0
 
 # SCTP support (optional - will fallback to TCP if not available)
 pysctp
 
 # For production use, consider adding:
 # redis  # For message queue persistence
-# gunicorn  # Production WSGI server
