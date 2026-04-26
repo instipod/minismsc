@@ -40,6 +40,17 @@ class SMSMessage:
     request_delivery_report: bool = False
 
 
+@dataclass
+class PendingSMS:
+    """Tracks a pending SMS awaiting acknowledgment"""
+    imsi: str
+    nas_message: bytes
+    ti: int
+    sent_time: float
+    retry_count: int = 0
+    max_retries: int = 5
+
+
 class SMSCService:
     """SMSC Service - handles SMS delivery via SGs interface"""
 
@@ -71,10 +82,16 @@ class SMSCService:
         self.connected = False
         self.running = False
         self.rp_reference = 0
+        self.ti_counter = 0
 
         # Message queue
         self.message_queue: list = []
         self.queue_lock = threading.Lock()
+
+        # Pending SMS tracking for retries
+        self.pending_sms: Dict[int, PendingSMS] = {}  # Key: TI value
+        self.pending_lock = threading.Lock()
+        self.retry_timeout = 3.0  # seconds
 
         logger.info(f"SMSC/VLR initialized - VLR: {vlr_name}, LAI: {lai_mcc}-{lai_mnc}-{lai_lac}")
 
@@ -192,16 +209,24 @@ class SMSCService:
 
         logger.info(f"SMS queued for {imsi}: {text[:50]} (delivery_report={request_delivery_report})")
 
+    def _get_next_ti(self) -> int:
+        """Get next Transaction Identifier (0-6, wrapping)"""
+        ti = self.ti_counter
+        self.ti_counter = (self.ti_counter + 1) % 7
+        return ti
+
     def _process_sms(self, sms: SMSMessage):
         """Process and send an SMS message"""
         try:
+            # Allocate TI for this transaction
+            ti = self._get_next_ti()
+
             # Create SMS TPDU (TP-DELIVER)
             tpdu = create_sms_deliver_pdu(sms.sender, sms.text,
                                          request_status_report=sms.request_delivery_report)
 
             # Wrap in RP-DATA
             self.rp_reference = (self.rp_reference + 1) % 256
-            # Try without RP-Destination Address since routing is via IMSI in SGsAP
             rp_data = create_rp_data_dl(
                 sms.destination_msisdn,
                 tpdu,
@@ -212,9 +237,19 @@ class SMSCService:
             logger.info(f"  TPDU ({len(tpdu)} bytes): {tpdu.hex()}")
             logger.info(f"  RP-DATA ({len(rp_data)} bytes): {rp_data.hex()}")
 
-            # Wrap in CP-DATA (NAS message)
-            nas_message = create_cp_data(rp_data)
+            # Wrap in CP-DATA (NAS message) with allocated TI
+            nas_message = create_cp_data(rp_data, ti)
             logger.info(f"  CP-DATA/NAS ({len(nas_message)} bytes): {nas_message.hex()}")
+
+            # Track as pending
+            with self.pending_lock:
+                self.pending_sms[ti] = PendingSMS(
+                    imsi=sms.destination_imsi,
+                    nas_message=nas_message,
+                    ti=ti,
+                    sent_time=time.time(),
+                    retry_count=0
+                )
 
             # Create SGsAP Downlink Unitdata message
             sgsap_msg = create_downlink_unitdata(sms.destination_imsi, nas_message)
@@ -222,7 +257,7 @@ class SMSCService:
             # Send to MME
             self._send_message(sgsap_msg)
 
-            logger.info(f"SMS sent to {sms.destination_imsi} from {sms.sender}")
+            logger.info(f"SMS sent to {sms.destination_imsi} from {sms.sender} (TI={ti})")
 
         except Exception as e:
             logger.error(f"Failed to send SMS: {e}")
@@ -297,12 +332,22 @@ class SMSCService:
                     pd_ti = nas_msg[0]
                     cp_msg_type = nas_msg[1]
 
-                    # Extract TI value (bits 5-7) for the response
+                    # Extract TI value (bits 4-6) and TI flag (bit 3)
                     ti_value = (pd_ti >> 4) & 0x07
+                    ti_flag = (pd_ti >> 3) & 0x01
 
                     if cp_msg_type == 0x04:  # CP-ACK
-                        logger.info(f"Received CP-ACK from IMSI: {imsi}")
-                        # No response needed for CP-ACK
+                        logger.info(f"Received CP-ACK from IMSI: {imsi}, TI={ti_value}, TI-flag={ti_flag}")
+
+                        # Mark message as acknowledged and remove from pending
+                        with self.pending_lock:
+                            if ti_value in self.pending_sms:
+                                pending = self.pending_sms[ti_value]
+                                duration = time.time() - pending.sent_time
+                                logger.info(f"✓ SMS acknowledged (TI={ti_value}, {duration:.2f}s, {pending.retry_count} retries)")
+                                del self.pending_sms[ti_value]
+                            else:
+                                logger.debug(f"CP-ACK for unknown TI={ti_value}")
 
                     elif cp_msg_type == 0x01:  # CP-DATA
                         # CP-DATA contains RP message
@@ -462,6 +507,41 @@ class SMSCService:
         except Exception as e:
             logger.error(f"Error parsing STATUS-REPORT: {e}")
 
+    def _check_pending_timeouts(self):
+        """Check for pending SMS that need retry"""
+        current_time = time.time()
+
+        with self.pending_lock:
+            to_retry = []
+            to_remove = []
+
+            for ti, pending in self.pending_sms.items():
+                elapsed = current_time - pending.sent_time
+
+                if elapsed >= self.retry_timeout:
+                    if pending.retry_count >= pending.max_retries:
+                        logger.error(f"✗ SMS delivery failed after {pending.max_retries} retries (TI={ti}, IMSI={pending.imsi})")
+                        to_remove.append(ti)
+                    else:
+                        to_retry.append((ti, pending))
+
+            # Remove failed messages
+            for ti in to_remove:
+                del self.pending_sms[ti]
+
+            # Retry messages
+            for ti, pending in to_retry:
+                pending.retry_count += 1
+                pending.sent_time = current_time
+
+                try:
+                    sgsap_msg = create_downlink_unitdata(pending.imsi, pending.nas_message)
+                    self._send_message(sgsap_msg)
+                    logger.warning(f"🔄 Retrying SMS (TI={ti}, attempt {pending.retry_count}/{pending.max_retries})")
+                except Exception as e:
+                    logger.error(f"Failed to retry SMS (TI={ti}): {e}")
+                    del self.pending_sms[ti]
+
     def run(self):
         """Main service loop"""
         self.running = True
@@ -479,6 +559,9 @@ class SMSCService:
                     if self.message_queue:
                         sms = self.message_queue.pop(0)
                         self._process_sms(sms)
+
+                # Check for messages needing retry
+                self._check_pending_timeouts()
 
                 time.sleep(0.1)
 
