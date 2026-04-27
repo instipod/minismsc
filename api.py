@@ -48,24 +48,14 @@ class SMSRequest(BaseModel):
         if len(v) > 160:
             raise ValueError('Text must not exceed 160 characters')
         return v
-
-
-class BulkSMSRequest(BaseModel):
-    messages: List[SMSRequest] = Field(..., description="List of SMS messages to send")
-
-    @field_validator('messages')
-    @classmethod
-    def validate_messages_length(cls, v: List[SMSRequest]) -> List[SMSRequest]:
-        if len(v) > 100:
-            raise ValueError('Maximum 100 messages per bulk request')
-        return v
-
+    
 
 class HealthResponse(BaseModel):
     status: str
     service: str
     connected: bool
     mme_count: int
+    queue_length: int
 
 
 class MMEInfo(BaseModel):
@@ -74,22 +64,6 @@ class MMEInfo(BaseModel):
     mme_name: Optional[str]
     connected_at: str
     pending_sms_count: int
-
-
-class LAIInfo(BaseModel):
-    mcc: str
-    mnc: str
-    lac: int
-
-
-class StatusResponse(BaseModel):
-    connected: bool
-    listen_address: str
-    listen_port: int
-    vlr_name: str
-    smsc_address: str
-    lai: LAIInfo
-    queue_length: int
 
 
 class SMSDetails(BaseModel):
@@ -105,19 +79,6 @@ class SMSResponse(BaseModel):
     message: str
     guid: str
     details: SMSDetails
-
-
-class BulkError(BaseModel):
-    index: int
-    imsi: Optional[str] = None
-    error: str
-
-
-class BulkSMSResponse(BaseModel):
-    queued: int
-    failed: int
-    guids: List[str]
-    errors: List[BulkError]
 
 
 class SMSStatusResponse(BaseModel):
@@ -143,7 +104,8 @@ async def health():
         status='healthy',
         service='mini-smsc',
         connected=len(mmes) > 0,
-        mme_count=len(mmes)
+        mme_count=len(mmes),
+        queue_length=len(smsc_service.db.get_queued())
     )
 
 
@@ -156,30 +118,6 @@ async def get_mmes():
             detail='SMSC service not initialized'
         )
     return [MMEInfo(**m) for m in smsc_service.get_connected_mmes()]
-
-
-@app.get('/api/status', response_model=StatusResponse)
-async def get_status():
-    """Get SMSC service status"""
-    if not smsc_service:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail='SMSC service not initialized'
-        )
-
-    return StatusResponse(
-        connected=smsc_service.connected,
-        listen_address=smsc_service.listen_address,
-        listen_port=smsc_service.listen_port,
-        vlr_name=smsc_service.vlr_name,
-        smsc_address=smsc_service.smsc_address,
-        lai=LAIInfo(
-            mcc=smsc_service.lai_mcc,
-            mnc=smsc_service.lai_mnc,
-            lac=smsc_service.lai_lac
-        ),
-        queue_length=len(smsc_service.db.get_queued())
-    )
 
 
 @app.post('/api/sms/send', response_model=SMSResponse, status_code=status.HTTP_202_ACCEPTED)
@@ -229,48 +167,7 @@ async def send_sms(sms: SMSRequest):
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=str(e)
         )
-
-
-@app.post('/api/sms/send/bulk', response_model=BulkSMSResponse, status_code=status.HTTP_202_ACCEPTED)
-async def send_bulk_sms(request: BulkSMSRequest):
-    """Send SMS to multiple subscribers"""
-    if not smsc_service:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail='SMSC service not initialized'
-        )
-
-    if not smsc_service.connected:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail='SMSC not connected to MME'
-        )
-
-    results = BulkSMSResponse(queued=0, failed=0, guids=[], errors=[])
-
-    for idx, msg in enumerate(request.messages):
-        msisdn = msg.msisdn or msg.imsi
-
-        try:
-            guid = smsc_service.send_sms(
-                msg.imsi,
-                msisdn,
-                msg.sender,
-                msg.text,
-                msg.request_delivery_report
-            )
-            results.queued += 1
-            results.guids.append(guid)
-        except Exception as e:
-            results.failed += 1
-            results.errors.append(BulkError(
-                index=idx,
-                imsi=msg.imsi,
-                error=str(e)
-            ))
-
-    return results
-
+    
 
 @app.get('/api/sms/status/{guid}', response_model=SMSStatusResponse)
 async def get_sms_status(guid: str):
