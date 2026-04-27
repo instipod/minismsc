@@ -65,6 +65,15 @@ class HealthResponse(BaseModel):
     status: str
     service: str
     connected: bool
+    mme_count: int
+
+
+class MMEInfo(BaseModel):
+    address: str
+    port: int
+    mme_name: Optional[str]
+    connected_at: str
+    pending_sms_count: int
 
 
 class LAIInfo(BaseModel):
@@ -129,11 +138,24 @@ class SMSStatusResponse(BaseModel):
 @app.get('/health', response_model=HealthResponse)
 async def health():
     """Health check endpoint"""
+    mmes = smsc_service.get_connected_mmes() if smsc_service else []
     return HealthResponse(
         status='healthy',
         service='mini-smsc',
-        connected=smsc_service.connected if smsc_service else False
+        connected=len(mmes) > 0,
+        mme_count=len(mmes)
     )
+
+
+@app.get('/api/mmes', response_model=List[MMEInfo])
+async def get_mmes():
+    """List all currently connected MMEs"""
+    if not smsc_service:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail='SMSC service not initialized'
+        )
+    return [MMEInfo(**m) for m in smsc_service.get_connected_mmes()]
 
 
 @app.get('/api/status', response_model=StatusResponse)
@@ -339,11 +361,11 @@ def main():
     )
 
     try:
-        # Start listening for MME
+        # Start listening for MME connections (non-blocking)
         logger.info("Starting SGsAP server...")
         smsc_service.listen()
 
-        # Start SMSC service in background thread
+        # Start SMSC service loop in background thread
         smsc_thread = threading.Thread(
             target=run_smsc_background,
             args=(smsc_service,),
@@ -351,10 +373,11 @@ def main():
         )
         smsc_thread.start()
 
-        # Start FastAPI with uvicorn
+        # Start FastAPI immediately — no need to wait for an MME to connect
         logger.info(f"Starting REST API on {args.api_host}:{args.api_port}")
         logger.info("\nAPI Endpoints:")
         logger.info(f"  GET  http://{args.api_host}:{args.api_port}/health")
+        logger.info(f"  GET  http://{args.api_host}:{args.api_port}/api/mmes")
         logger.info(f"  GET  http://{args.api_host}:{args.api_port}/api/status")
         logger.info(f"  POST http://{args.api_host}:{args.api_port}/api/sms/send")
         logger.info(f"  POST http://{args.api_host}:{args.api_port}/api/sms/send/bulk")
