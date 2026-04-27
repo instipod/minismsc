@@ -48,39 +48,22 @@ class SMSRequest(BaseModel):
         if len(v) > 160:
             raise ValueError('Text must not exceed 160 characters')
         return v
-
-
-class BulkSMSRequest(BaseModel):
-    messages: List[SMSRequest] = Field(..., description="List of SMS messages to send")
-
-    @field_validator('messages')
-    @classmethod
-    def validate_messages_length(cls, v: List[SMSRequest]) -> List[SMSRequest]:
-        if len(v) > 100:
-            raise ValueError('Maximum 100 messages per bulk request')
-        return v
-
+    
 
 class HealthResponse(BaseModel):
     status: str
     service: str
     connected: bool
-
-
-class LAIInfo(BaseModel):
-    mcc: str
-    mnc: str
-    lac: int
-
-
-class StatusResponse(BaseModel):
-    connected: bool
-    listen_address: str
-    listen_port: int
-    vlr_name: str
-    smsc_address: str
-    lai: LAIInfo
+    mme_count: int
     queue_length: int
+
+
+class MMEInfo(BaseModel):
+    address: str
+    port: int
+    mme_name: Optional[str]
+    connected_at: str
+    pending_sms_count: int
 
 
 class SMSDetails(BaseModel):
@@ -94,54 +77,47 @@ class SMSDetails(BaseModel):
 class SMSResponse(BaseModel):
     status: str
     message: str
+    guid: str
     details: SMSDetails
 
 
-class BulkError(BaseModel):
-    index: int
-    imsi: Optional[str] = None
-    error: str
-
-
-class BulkSMSResponse(BaseModel):
-    queued: int
-    failed: int
-    errors: List[BulkError]
+class SMSStatusResponse(BaseModel):
+    guid: str
+    status: str
+    imsi: str
+    msisdn: str
+    sender: str
+    created_at: float
+    last_attempt_at: Optional[float] = None
+    retry_count: int
+    do_not_deliver_after: Optional[float] = None
+    store_until: float
+    error_reason: Optional[str] = None
 
 
 # Endpoints
 @app.get('/health', response_model=HealthResponse)
 async def health():
     """Health check endpoint"""
+    mmes = smsc_service.get_connected_mmes() if smsc_service else []
     return HealthResponse(
         status='healthy',
         service='mini-smsc',
-        connected=smsc_service.connected if smsc_service else False
+        connected=len(mmes) > 0,
+        mme_count=len(mmes),
+        queue_length=len(smsc_service.db.get_queued())
     )
 
 
-@app.get('/api/status', response_model=StatusResponse)
-async def get_status():
-    """Get SMSC service status"""
+@app.get('/api/mmes', response_model=List[MMEInfo])
+async def get_mmes():
+    """List all currently connected MMEs"""
     if not smsc_service:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail='SMSC service not initialized'
         )
-
-    return StatusResponse(
-        connected=smsc_service.connected,
-        listen_address=smsc_service.listen_address,
-        listen_port=smsc_service.listen_port,
-        vlr_name=smsc_service.vlr_name,
-        smsc_address=smsc_service.smsc_address,
-        lai=LAIInfo(
-            mcc=smsc_service.lai_mcc,
-            mnc=smsc_service.lai_mnc,
-            lac=smsc_service.lai_lac
-        ),
-        queue_length=len(smsc_service.message_queue)
-    )
+    return [MMEInfo(**m) for m in smsc_service.get_connected_mmes()]
 
 
 @app.post('/api/sms/send', response_model=SMSResponse, status_code=status.HTTP_202_ACCEPTED)
@@ -162,7 +138,7 @@ async def send_sms(sms: SMSRequest):
     msisdn = sms.msisdn or sms.imsi
 
     try:
-        smsc_service.send_sms(
+        guid = smsc_service.send_sms(
             imsi=sms.imsi,
             msisdn=msisdn,
             sender=sms.sender,
@@ -170,11 +146,12 @@ async def send_sms(sms: SMSRequest):
             request_delivery_report=sms.request_delivery_report
         )
 
-        logger.info(f"API: SMS queued for {sms.imsi}")
+        logger.info(f"API: SMS queued for {sms.imsi} with GUID {guid}")
 
         return SMSResponse(
             status='queued',
             message='SMS queued for delivery',
+            guid=guid,
             details=SMSDetails(
                 imsi=sms.imsi,
                 msisdn=msisdn,
@@ -190,46 +167,38 @@ async def send_sms(sms: SMSRequest):
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=str(e)
         )
+    
 
-
-@app.post('/api/sms/send/bulk', response_model=BulkSMSResponse, status_code=status.HTTP_202_ACCEPTED)
-async def send_bulk_sms(request: BulkSMSRequest):
-    """Send SMS to multiple subscribers"""
+@app.get('/api/sms/status/{guid}', response_model=SMSStatusResponse)
+async def get_sms_status(guid: str):
+    """Query SMS delivery status by GUID"""
     if not smsc_service:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail='SMSC service not initialized'
         )
 
-    if not smsc_service.connected:
+    msg_row = smsc_service.db.get_by_guid(guid)
+
+    if not msg_row:
         raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail='SMSC not connected to MME'
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f'Message with GUID {guid} not found'
         )
 
-    results = BulkSMSResponse(queued=0, failed=0, errors=[])
-
-    for idx, msg in enumerate(request.messages):
-        msisdn = msg.msisdn or msg.imsi
-
-        try:
-            smsc_service.send_sms(
-                msg.imsi,
-                msisdn,
-                msg.sender,
-                msg.text,
-                msg.request_delivery_report
-            )
-            results.queued += 1
-        except Exception as e:
-            results.failed += 1
-            results.errors.append(BulkError(
-                index=idx,
-                imsi=msg.imsi,
-                error=str(e)
-            ))
-
-    return results
+    return SMSStatusResponse(
+        guid=msg_row['guid'],
+        status=msg_row['status'],
+        imsi=msg_row['imsi'],
+        msisdn=msg_row['msisdn'],
+        sender=msg_row['sender'],
+        created_at=msg_row['created_at'],
+        last_attempt_at=msg_row.get('last_attempt_at'),
+        retry_count=msg_row['retry_count'],
+        do_not_deliver_after=msg_row.get('do_not_deliver_after'),
+        store_until=msg_row['store_until'],
+        error_reason=msg_row.get('error_reason')
+    )
 
 
 def run_smsc_background(smsc: SMSCService):
@@ -289,11 +258,11 @@ def main():
     )
 
     try:
-        # Start listening for MME
+        # Start listening for MME connections (non-blocking)
         logger.info("Starting SGsAP server...")
         smsc_service.listen()
 
-        # Start SMSC service in background thread
+        # Start SMSC service loop in background thread
         smsc_thread = threading.Thread(
             target=run_smsc_background,
             args=(smsc_service,),
@@ -301,10 +270,11 @@ def main():
         )
         smsc_thread.start()
 
-        # Start FastAPI with uvicorn
+        # Start FastAPI immediately — no need to wait for an MME to connect
         logger.info(f"Starting REST API on {args.api_host}:{args.api_port}")
         logger.info("\nAPI Endpoints:")
         logger.info(f"  GET  http://{args.api_host}:{args.api_port}/health")
+        logger.info(f"  GET  http://{args.api_host}:{args.api_port}/api/mmes")
         logger.info(f"  GET  http://{args.api_host}:{args.api_port}/api/status")
         logger.info(f"  POST http://{args.api_host}:{args.api_port}/api/sms/send")
         logger.info(f"  POST http://{args.api_host}:{args.api_port}/api/sms/send/bulk")
