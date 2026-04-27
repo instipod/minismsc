@@ -20,6 +20,7 @@ from sgsap_protocol import (
     decode_imsi, decode_location_area_id
 )
 from sms_encoder import create_sms_deliver_pdu, create_rp_data_dl, create_cp_data, create_cp_ack
+from sms_database import SMSDatabase
 
 
 logging.basicConfig(
@@ -56,7 +57,7 @@ class SMSCService:
 
     def __init__(self, listen_address: str, listen_port: int, vlr_name: str,
                  lai_mcc: str = "001", lai_mnc: str = "01", lai_lac: int = 1,
-                 smsc_address: str = "+0000"):
+                 smsc_address: str = "+0000", db_path: str = "sms.db"):
         """
         Initialize SMSC service
 
@@ -68,6 +69,7 @@ class SMSCService:
             lai_mnc: Location Area MNC (default: "01")
             lai_lac: Location Area Code (default: 1)
             smsc_address: SMSC service center number (default: "+0000")
+            db_path: Path to SQLite database (default: "sms.db")
         """
         self.listen_address = listen_address
         self.listen_port = listen_port
@@ -84,16 +86,32 @@ class SMSCService:
         self.rp_reference = 0
         self.ti_counter = 0
 
-        # Message queue
-        self.message_queue: list = []
-        self.queue_lock = threading.Lock()
+        # Database for message persistence
+        self.db = SMSDatabase(db_path)
 
-        # Pending SMS tracking for retries
-        self.pending_sms: Dict[int, PendingSMS] = {}  # Key: TI value
+        # Pending SMS tracking (TI → GUID mapping)
+        self.pending_sms: Dict[int, str] = {}  # Key: TI value, Value: GUID
         self.pending_lock = threading.Lock()
         self.retry_timeout = 3.0  # seconds
+        self.max_retries = 5
+
+        # Recover pending messages from database on startup
+        self._recover_pending_messages()
 
         logger.info(f"SMSC/VLR initialized - VLR: {vlr_name}, LAI: {lai_mcc}-{lai_mnc}-{lai_lac}")
+
+    def _recover_pending_messages(self):
+        """Recover pending messages from database on startup"""
+        pending = self.db.get_all_pending()
+        logger.info(f"Recovering {len(pending)} pending messages from database")
+
+        for msg_row in pending:
+            # Reset TI to null (will be reassigned on next send)
+            self.db.reset_ti(msg_row['guid'])
+            # Update status back to queued
+            self.db.update_status(msg_row['guid'], 'queued')
+
+        logger.info("Message recovery complete")
 
     def listen(self):
         """Listen for MME connection via SCTP (SGsAP server)"""
@@ -184,7 +202,9 @@ class SMSCService:
             return None
 
     def send_sms(self, imsi: str, msisdn: str, sender: str, text: str,
-                 request_delivery_report: bool = False):
+                 request_delivery_report: bool = False,
+                 do_not_deliver_after: Optional[float] = None,
+                 store_until: Optional[float] = None) -> str:
         """
         Queue an SMS for delivery
 
@@ -194,20 +214,24 @@ class SMSCService:
             sender: Sender phone number
             text: SMS text content
             request_delivery_report: Request delivery report from UE
+            do_not_deliver_after: Unix timestamp to stop retrying (default: 24 hours)
+            store_until: Unix timestamp to delete from database (default: 7 days)
+
+        Returns:
+            GUID string for tracking message status
         """
-        sms = SMSMessage(
-            destination_imsi=imsi,
-            destination_msisdn=msisdn,
+        guid = self.db.insert_message(
+            imsi=imsi,
+            msisdn=msisdn,
             sender=sender,
             text=text,
-            timestamp=datetime.now(),
-            request_delivery_report=request_delivery_report
+            request_delivery_report=request_delivery_report,
+            do_not_deliver_after=do_not_deliver_after,
+            store_until=store_until
         )
 
-        with self.queue_lock:
-            self.message_queue.append(sms)
-
-        logger.info(f"SMS queued for {imsi}: {text[:50]} (delivery_report={request_delivery_report})")
+        logger.info(f"SMS queued for {imsi} with GUID {guid}: {text[:50]} (delivery_report={request_delivery_report})")
+        return guid
 
     def _get_next_ti(self) -> int:
         """Get next Transaction Identifier (0-6, wrapping)"""
@@ -215,20 +239,47 @@ class SMSCService:
         self.ti_counter = (self.ti_counter + 1) % 7
         return ti
 
-    def _process_sms(self, sms: SMSMessage):
-        """Process and send an SMS message"""
+    def _get_available_ti(self) -> Optional[int]:
+        """Get next available TI (0-6), return None if all in use"""
+        with self.pending_lock:
+            for ti in range(7):
+                if ti not in self.pending_sms:
+                    return ti
+        return None
+
+    def _process_sms(self, guid: str):
+        """Process and send an SMS message by GUID"""
         try:
-            # Allocate TI for this transaction
-            ti = self._get_next_ti()
+            # Load message from database
+            msg_row = self.db.get_by_guid(guid)
+            if not msg_row:
+                logger.error(f"GUID {guid} not found in database")
+                return
+
+            # Check do_not_deliver_after
+            if msg_row['do_not_deliver_after']:
+                if time.time() > msg_row['do_not_deliver_after']:
+                    logger.warning(f"GUID {guid} expired (do_not_deliver_after)")
+                    self.db.update_status(guid, 'failed', 'Expired: do_not_deliver_after')
+                    return
+
+            # Get available TI slot
+            ti = self._get_available_ti()
+            if ti is None:
+                logger.debug(f"No available TI slots, GUID {guid} will retry later")
+                return
 
             # Create SMS TPDU (TP-DELIVER)
-            tpdu = create_sms_deliver_pdu(sms.sender, sms.text,
-                                         request_status_report=sms.request_delivery_report)
+            tpdu = create_sms_deliver_pdu(
+                msg_row['sender'],
+                msg_row['message_text'],
+                request_status_report=bool(msg_row['request_delivery_report'])
+            )
 
             # Wrap in RP-DATA
             self.rp_reference = (self.rp_reference + 1) % 256
             rp_data = create_rp_data_dl(
-                sms.destination_msisdn,
+                msg_row['msisdn'],
                 tpdu,
                 self.rp_reference,
                 self.smsc_address,
@@ -241,26 +292,24 @@ class SMSCService:
             nas_message = create_cp_data(rp_data, ti)
             logger.info(f"  CP-DATA/NAS ({len(nas_message)} bytes): {nas_message.hex()}")
 
-            # Track as pending
+            # Mark as sent in database
+            self.db.mark_sent(guid, ti)
+
+            # Track TI → GUID mapping
             with self.pending_lock:
-                self.pending_sms[ti] = PendingSMS(
-                    imsi=sms.destination_imsi,
-                    nas_message=nas_message,
-                    ti=ti,
-                    sent_time=time.time(),
-                    retry_count=0
-                )
+                self.pending_sms[ti] = guid
 
             # Create SGsAP Downlink Unitdata message
-            sgsap_msg = create_downlink_unitdata(sms.destination_imsi, nas_message)
+            sgsap_msg = create_downlink_unitdata(msg_row['imsi'], nas_message)
 
             # Send to MME
             self._send_message(sgsap_msg)
 
-            logger.info(f"SMS sent to {sms.destination_imsi} from {sms.sender} (TI={ti})")
+            logger.info(f"SMS sent GUID={guid}, TI={ti}, IMSI={msg_row['imsi']}, sender={msg_row['sender']}")
 
         except Exception as e:
-            logger.error(f"Failed to send SMS: {e}")
+            logger.error(f"Failed to send GUID {guid}: {e}")
+            self.db.update_status(guid, 'failed', str(e))
 
     def _handle_incoming_message(self, msg: SGsAPMessage):
         """Handle incoming SGsAP message from MME"""
@@ -339,13 +388,22 @@ class SMSCService:
                     if cp_msg_type == 0x04:  # CP-ACK
                         logger.info(f"Received CP-ACK from IMSI: {imsi}, TI={ti_value}, TI-flag={ti_flag}")
 
-                        # Mark message as acknowledged and remove from pending
+                        # Mark message as acknowledged
                         with self.pending_lock:
-                            if ti_value in self.pending_sms:
-                                pending = self.pending_sms[ti_value]
-                                duration = time.time() - pending.sent_time
-                                logger.info(f"✓ SMS acknowledged (TI={ti_value}, {duration:.2f}s, {pending.retry_count} retries)")
-                                del self.pending_sms[ti_value]
+                            guid = self.pending_sms.get(ti_value)
+                            if guid:
+                                msg_row = self.db.get_by_guid(guid)
+                                if msg_row:
+                                    duration = time.time() - msg_row['last_attempt_at']
+                                    logger.info(f"✓ CP-ACK received GUID={guid}, TI={ti_value}, {duration:.2f}s, retry={msg_row['retry_count']}")
+
+                                    # Update status to acknowledged
+                                    self.db.update_status(guid, 'acknowledged')
+
+                                    # Free TI slot (but keep GUID in database for RP-ACK tracking)
+                                    del self.pending_sms[ti_value]
+                                else:
+                                    logger.warning(f"CP-ACK for GUID {guid} not found in DB")
                             else:
                                 logger.debug(f"CP-ACK for unknown TI={ti_value}")
 
@@ -362,6 +420,18 @@ class SMSCService:
 
                                 if rp_msg_type == 0x02:  # RP-ACK (MS to Network)
                                     logger.info(f"Received RP-ACK from IMSI: {imsi} - SMS delivered successfully")
+
+                                    # Find message by TI or IMSI (TI may be freed by CP-ACK)
+                                    msg_row = self.db.get_by_ti(ti_value)
+                                    if not msg_row:
+                                        # Search by IMSI in acknowledged state
+                                        msg_row = self.db.get_by_imsi_acknowledged(imsi)
+
+                                    if msg_row:
+                                        logger.info(f"✓ RP-ACK marks GUID={msg_row['guid']} as DELIVERED")
+                                        self.db.update_status(msg_row['guid'], 'delivered')
+                                    else:
+                                        logger.warning(f"RP-ACK from {imsi} but no acknowledged message found")
 
                                     # Send CP-ACK to complete the transaction
                                     cp_ack = create_cp_ack(ti_value)
@@ -508,39 +578,59 @@ class SMSCService:
             logger.error(f"Error parsing STATUS-REPORT: {e}")
 
     def _check_pending_timeouts(self):
-        """Check for pending SMS that need retry"""
+        """Check for messages needing retry"""
         current_time = time.time()
 
-        with self.pending_lock:
-            to_retry = []
-            to_remove = []
+        # Get all pending messages from database
+        pending_messages = self.db.get_pending_for_retry()
 
-            for ti, pending in self.pending_sms.items():
-                elapsed = current_time - pending.sent_time
+        for msg_row in pending_messages:
+            guid = msg_row['guid']
+            last_attempt = msg_row.get('last_attempt_at')
 
-                if elapsed >= self.retry_timeout:
-                    if pending.retry_count >= pending.max_retries:
-                        logger.error(f"✗ SMS delivery failed after {pending.max_retries} retries (TI={ti}, IMSI={pending.imsi})")
-                        to_remove.append(ti)
-                    else:
-                        to_retry.append((ti, pending))
+            if not last_attempt:
+                continue
 
-            # Remove failed messages
-            for ti in to_remove:
-                del self.pending_sms[ti]
+            elapsed = current_time - last_attempt
 
-            # Retry messages
-            for ti, pending in to_retry:
-                pending.retry_count += 1
-                pending.sent_time = current_time
+            # Check timeout
+            if elapsed >= self.retry_timeout:
+                # Check do_not_deliver_after
+                if msg_row['do_not_deliver_after']:
+                    if current_time > msg_row['do_not_deliver_after']:
+                        logger.error(f"✗ GUID {guid} failed: do_not_deliver_after exceeded")
+                        self.db.update_status(guid, 'failed', 'Expired: do_not_deliver_after')
 
-                try:
-                    sgsap_msg = create_downlink_unitdata(pending.imsi, pending.nas_message)
-                    self._send_message(sgsap_msg)
-                    logger.warning(f"🔄 Retrying SMS (TI={ti}, attempt {pending.retry_count}/{pending.max_retries})")
-                except Exception as e:
-                    logger.error(f"Failed to retry SMS (TI={ti}): {e}")
-                    del self.pending_sms[ti]
+                        # Free TI if held
+                        if msg_row['ti'] is not None:
+                            with self.pending_lock:
+                                self.pending_sms.pop(msg_row['ti'], None)
+                        continue
+
+                # Check max retries
+                if msg_row['retry_count'] >= self.max_retries:
+                    logger.error(f"✗ GUID {guid} failed after {self.max_retries} retries")
+                    self.db.update_status(guid, 'failed', f'Max retries ({self.max_retries}) exceeded')
+
+                    # Free TI if held
+                    if msg_row['ti'] is not None:
+                        with self.pending_lock:
+                            self.pending_sms.pop(msg_row['ti'], None)
+                    continue
+
+                # Retry: update status and reset TI
+                logger.warning(f"🔄 Retrying GUID {guid} (attempt {msg_row['retry_count'] + 1}/{self.max_retries})")
+
+                # Update status to retrying
+                self.db.update_status(guid, 'retrying')
+
+                # Free old TI
+                if msg_row['ti'] is not None:
+                    with self.pending_lock:
+                        self.pending_sms.pop(msg_row['ti'], None)
+
+                # Reset TI to null (will be reassigned on next send)
+                self.db.reset_ti(guid)
 
     def run(self):
         """Main service loop"""
@@ -550,15 +640,19 @@ class SMSCService:
         receiver_thread = threading.Thread(target=self._receiver_loop, daemon=True)
         receiver_thread.start()
 
+        # Start cleanup thread
+        cleanup_thread = threading.Thread(target=self._cleanup_loop, daemon=True)
+        cleanup_thread.start()
+
         logger.info("SMSC service running")
 
         try:
             while self.running:
-                # Process queued messages
-                with self.queue_lock:
-                    if self.message_queue:
-                        sms = self.message_queue.pop(0)
-                        self._process_sms(sms)
+                # Get queued messages from database
+                queued = self.db.get_queued(limit=10)
+
+                for msg_row in queued:
+                    self._process_sms(msg_row['guid'])
 
                 # Check for messages needing retry
                 self._check_pending_timeouts()
@@ -570,6 +664,19 @@ class SMSCService:
         finally:
             self.running = False
             self.disconnect()
+
+    def _cleanup_loop(self):
+        """Background thread for cleaning up expired messages"""
+        while self.running:
+            try:
+                deleted = self.db.cleanup_expired()
+                if deleted > 0:
+                    logger.info(f"Cleaned up {deleted} expired messages (past store_until)")
+            except Exception as e:
+                logger.error(f"Cleanup error: {e}")
+
+            # Run cleanup every 1 hour
+            time.sleep(3600)
 
     def _receiver_loop(self):
         """Background thread for receiving messages"""
