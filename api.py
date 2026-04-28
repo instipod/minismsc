@@ -95,6 +95,12 @@ class SMSStatusResponse(BaseModel):
     error_reason: Optional[str] = None
 
 
+class IMSIMappingInfo(BaseModel):
+    imsi: str
+    mme_address: str
+    last_updated: float
+
+
 # Endpoints
 @app.get('/health', response_model=HealthResponse)
 async def health():
@@ -105,7 +111,7 @@ async def health():
         service='mini-smsc',
         connected=len(mmes) > 0,
         mme_count=len(mmes),
-        queue_length=len(smsc_service.db.get_queued())
+        queue_length=len(smsc_service.db.get_queued()) if smsc_service else 0
     )
 
 
@@ -118,6 +124,42 @@ async def get_mmes():
             detail='SMSC service not initialized'
         )
     return [MMEInfo(**m) for m in smsc_service.get_connected_mmes()]
+
+
+@app.get('/api/imsi-mappings', response_model=List[IMSIMappingInfo])
+async def get_imsi_mappings():
+    """Get all IMSI-to-MME mappings for monitoring"""
+    if not smsc_service:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail='SMSC service not initialized'
+        )
+    mappings = smsc_service.db.get_all_imsi_mme_mappings()
+    return [IMSIMappingInfo(**m) for m in mappings]
+
+
+@app.delete('/api/imsi-mappings/{imsi}')
+async def delete_imsi_mapping(imsi: str):
+    """Clear IMSI-to-MME mapping (forces broadcast on next SMS)"""
+    if not smsc_service:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail='SMSC service not initialized'
+        )
+
+    with smsc_service.connections_lock:
+        was_mapped = imsi in smsc_service.imsi_to_mme
+        smsc_service.imsi_to_mme.pop(imsi, None)
+
+    smsc_service.db.remove_imsi_mme_mapping(imsi)
+
+    logger.info(f"API: Cleared IMSI mapping for {imsi}")
+
+    return {
+        'status': 'success',
+        'message': f'Mapping cleared for IMSI {imsi}',
+        'was_mapped': was_mapped
+    }
 
 
 @app.post('/api/sms/send', response_model=SMSResponse, status_code=status.HTTP_202_ACCEPTED)
@@ -222,14 +264,14 @@ def main():
                        default=int(os.getenv('LISTEN_PORT', '29118')),
                        help='SGsAP server port (env: LISTEN_PORT, default: 29118)')
     parser.add_argument('--vlr-name',
-                       default=os.getenv('VLR_NAME', 'vlr.open5gs.org'),
-                       help='VLR/MSC FQDN (env: VLR_NAME, default: vlr.open5gs.org)')
+                       default=os.getenv('VLR_NAME', 'smsc.epc.mnc010.mcc315.3gppnetwork.org'),
+                       help='VLR/MSC FQDN (env: VLR_NAME, default: smsc.epc.mnc010.mcc315.3gppnetwork.org)')
     parser.add_argument('--lai-mcc',
-                       default=os.getenv('LAI_MCC', '001'),
-                       help='Location Area MCC (env: LAI_MCC, default: 001)')
+                       default=os.getenv('LAI_MCC', '315'),
+                       help='Location Area MCC (env: LAI_MCC, default: 315)')
     parser.add_argument('--lai-mnc',
-                       default=os.getenv('LAI_MNC', '01'),
-                       help='Location Area MNC (env: LAI_MNC, default: 01)')
+                       default=os.getenv('LAI_MNC', '010'),
+                       help='Location Area MNC (env: LAI_MNC, default: 010)')
     parser.add_argument('--lai-lac', type=int,
                        default=int(os.getenv('LAI_LAC', '1')),
                        help='Location Area Code (env: LAI_LAC, default: 1)')
@@ -272,13 +314,6 @@ def main():
 
         # Start FastAPI immediately — no need to wait for an MME to connect
         logger.info(f"Starting REST API on {args.api_host}:{args.api_port}")
-        logger.info("\nAPI Endpoints:")
-        logger.info(f"  GET  http://{args.api_host}:{args.api_port}/health")
-        logger.info(f"  GET  http://{args.api_host}:{args.api_port}/api/mmes")
-        logger.info(f"  GET  http://{args.api_host}:{args.api_port}/api/status")
-        logger.info(f"  POST http://{args.api_host}:{args.api_port}/api/sms/send")
-        logger.info(f"  POST http://{args.api_host}:{args.api_port}/api/sms/send/bulk")
-        logger.info(f"  Docs: http://{args.api_host}:{args.api_port}/docs")
 
         uvicorn.run(app, host=args.api_host, port=args.api_port, log_level="info")
 

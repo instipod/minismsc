@@ -1,3 +1,4 @@
 .code
 .pycharm
 venv
+__pycache__

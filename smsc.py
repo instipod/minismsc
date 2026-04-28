@@ -112,11 +112,11 @@ class SMSCService:
         self.mme_connections: Dict[str, MMEConnection] = {}
         self.connections_lock = threading.RLock()
 
-        # IMSI → MME key mapping (updated on Location Update / Detach)
-        self.imsi_to_mme: Dict[str, str] = {}
-
         # Database for message persistence
         self.db = SMSDatabase(db_path)
+
+        # IMSI → MME address mapping (loaded from DB, updated on Location Update / Detach)
+        self.imsi_to_mme: Dict[str, str] = self.db.load_imsi_mme_mappings()
 
         self.retry_timeout = 3.0
         self.max_retries = 5
@@ -285,8 +285,8 @@ class SMSCService:
         # Cleanup on disconnect
         logger.info(f"[{mme.key}] Receiver loop exiting, cleaning up")
         with self.connections_lock:
-            for imsi, key in list(self.imsi_to_mme.items()):
-                if key == mme.key:
+            for imsi, mme_addr in list(self.imsi_to_mme.items()):
+                if mme_addr == mme.host:
                     del self.imsi_to_mme[imsi]
             self.mme_connections.pop(mme.key, None)
 
@@ -331,47 +331,60 @@ class SMSCService:
 
             # Route to the MME that has this IMSI registered
             with self.connections_lock:
-                mme_key = self.imsi_to_mme.get(msg_row['imsi'])
-                mme = self.mme_connections.get(mme_key) if mme_key else None
+                mme_address = self.imsi_to_mme.get(msg_row['imsi'])
+                target_mmes = []
 
-            if not mme or not mme.connected:
+                if mme_address:
+                    # IMSI is known - find the MME connection by address
+                    for mme in self.mme_connections.values():
+                        if mme.host == mme_address and mme.connected:
+                            target_mmes = [mme]
+                            break
+                else:
+                    # IMSI is unknown - broadcast to all connected MMEs
+                    logger.info(f"IMSI {msg_row['imsi']} not mapped to any MME, broadcasting to all connected MMEs")
+                    target_mmes = [mme for mme in self.mme_connections.values() if mme.connected]
+
+            if not target_mmes:
                 logger.debug(f"No connected MME for IMSI {msg_row['imsi']}, deferring GUID {guid}")
                 return
 
-            ti = mme.get_available_ti()
-            if ti is None:
-                logger.debug(f"No available TI slots on {mme.key} for GUID {guid}")
-                return
+            # Send to all target MMEs
+            for mme in target_mmes:
+                ti = mme.get_available_ti()
+                if ti is None:
+                    logger.debug(f"No available TI slots on {mme.key} for GUID {guid}")
+                    continue
 
-            tpdu = create_sms_deliver_pdu(
-                msg_row['sender'],
-                msg_row['message_text'],
-                request_status_report=bool(msg_row['request_delivery_report'])
-            )
+                tpdu = create_sms_deliver_pdu(
+                    msg_row['sender'],
+                    msg_row['message_text'],
+                    request_status_report=bool(msg_row['request_delivery_report'])
+                )
 
-            mme.rp_reference = (mme.rp_reference + 1) % 256
-            rp_data = create_rp_data_dl(
-                msg_row['msisdn'],
-                tpdu,
-                mme.rp_reference,
-                self.smsc_address,
-                include_destination=False
-            )
-            logger.info(f"  TPDU ({len(tpdu)} bytes): {tpdu.hex()}")
-            logger.info(f"  RP-DATA ({len(rp_data)} bytes): {rp_data.hex()}")
+                mme.rp_reference = (mme.rp_reference + 1) % 256
+                rp_data = create_rp_data_dl(
+                    msg_row['msisdn'],
+                    tpdu,
+                    mme.rp_reference,
+                    self.smsc_address,
+                    include_destination=False
+                )
+                logger.info(f"  TPDU ({len(tpdu)} bytes): {tpdu.hex()}")
+                logger.info(f"  RP-DATA ({len(rp_data)} bytes): {rp_data.hex()}")
 
-            nas_message = create_cp_data(rp_data, ti)
-            logger.info(f"  CP-DATA/NAS ({len(nas_message)} bytes): {nas_message.hex()}")
+                nas_message = create_cp_data(rp_data, ti)
+                logger.info(f"  CP-DATA/NAS ({len(nas_message)} bytes): {nas_message.hex()}")
 
-            self.db.mark_sent(guid, ti)
+                self.db.mark_sent(guid, ti)
 
-            with mme.pending_lock:
-                mme.pending_sms[ti] = guid
+                with mme.pending_lock:
+                    mme.pending_sms[ti] = guid
 
-            sgsap_msg = create_downlink_unitdata(msg_row['imsi'], nas_message)
-            self._send_to_mme(mme, sgsap_msg)
+                sgsap_msg = create_downlink_unitdata(msg_row['imsi'], nas_message)
+                self._send_to_mme(mme, sgsap_msg)
 
-            logger.info(f"SMS sent GUID={guid}, TI={ti}, IMSI={msg_row['imsi']}, MME={mme.key}")
+                logger.info(f"SMS sent GUID={guid}, TI={ti}, IMSI={msg_row['imsi']}, MME={mme.key}")
 
         except Exception as e:
             logger.error(f"Failed to send GUID {guid}: {e}")
@@ -403,7 +416,8 @@ class SMSCService:
 
                 # Record which MME this subscriber is on
                 with self.connections_lock:
-                    self.imsi_to_mme[imsi] = mme.key
+                    self.imsi_to_mme[imsi] = mme.host
+                self.db.set_imsi_mme_mapping(imsi, mme.host)
 
                 accept_msg = create_location_update_accept(
                     imsi, self.lai_mcc, self.lai_mnc, self.lai_lac
@@ -418,6 +432,7 @@ class SMSCService:
 
                 with self.connections_lock:
                     self.imsi_to_mme.pop(imsi, None)
+                self.db.remove_imsi_mme_mapping(imsi)
 
                 ack_msg = create_imsi_detach_ack(imsi)
                 self._send_to_mme(mme, ack_msg)
@@ -429,6 +444,7 @@ class SMSCService:
 
                 with self.connections_lock:
                     self.imsi_to_mme.pop(imsi, None)
+                self.db.remove_imsi_mme_mapping(imsi)
 
                 ack_msg = create_eps_detach_ack(imsi)
                 self._send_to_mme(mme, ack_msg)

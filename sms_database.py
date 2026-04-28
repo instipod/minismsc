@@ -47,6 +47,16 @@ class SMSDatabase:
             conn.execute("CREATE INDEX IF NOT EXISTS idx_ti ON messages(ti)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_store_until ON messages(store_until)")
 
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS imsi_mme_mappings (
+                    imsi TEXT PRIMARY KEY,
+                    mme_address TEXT NOT NULL,
+                    last_updated REAL NOT NULL
+                )
+            """)
+
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_mme ON imsi_mme_mappings(mme_address)")
+
             logger.debug("Database schema initialized")
 
     @contextmanager
@@ -209,3 +219,48 @@ class SMSDatabase:
             logger.info(f"Cleaned up {count} expired messages")
 
         return count
+
+    def set_imsi_mme_mapping(self, imsi: str, mme_address: str):
+        """Record which MME an IMSI is registered on"""
+        with self._get_conn() as conn:
+            conn.execute("""
+                INSERT OR REPLACE INTO imsi_mme_mappings (imsi, mme_address, last_updated)
+                VALUES (?, ?, ?)
+            """, (imsi, mme_address, time.time()))
+        logger.debug(f"Mapped IMSI {imsi} to MME {mme_address}")
+
+    def remove_imsi_mme_mapping(self, imsi: str):
+        """Remove IMSI-to-MME mapping (on detach)"""
+        with self._get_conn() as conn:
+            conn.execute("DELETE FROM imsi_mme_mappings WHERE imsi = ?", (imsi,))
+        logger.debug(f"Removed IMSI mapping for {imsi}")
+
+    def get_imsi_mme_mapping(self, imsi: str) -> Optional[str]:
+        """Get MME address for an IMSI"""
+        with self._get_conn() as conn:
+            row = conn.execute(
+                "SELECT mme_address FROM imsi_mme_mappings WHERE imsi = ?", (imsi,)
+            ).fetchone()
+            return row['mme_address'] if row else None
+
+    def get_all_imsi_mme_mappings(self) -> List[Dict[str, Any]]:
+        """Get all IMSI-to-MME mappings"""
+        with self._get_conn() as conn:
+            rows = conn.execute("""
+                SELECT imsi, mme_address, last_updated
+                FROM imsi_mme_mappings
+                ORDER BY last_updated DESC
+            """).fetchall()
+            return [dict(row) for row in rows]
+
+    def load_imsi_mme_mappings(self) -> Dict[str, str]:
+        """Load all IMSI-to-MME mappings into a dict"""
+        mappings = {}
+        with self._get_conn() as conn:
+            rows = conn.execute(
+                "SELECT imsi, mme_address FROM imsi_mme_mappings"
+            ).fetchall()
+            for row in rows:
+                mappings[row['imsi']] = row['mme_address']
+        logger.info(f"Loaded {len(mappings)} IMSI-to-MME mappings from database")
+        return mappings
