@@ -465,7 +465,7 @@ class SMSCService:
                     pd_ti = nas_msg[0]
                     cp_msg_type = nas_msg[1]
                     ti_value = (pd_ti >> 4) & 0x07
-                    ti_flag = (pd_ti >> 3) & 0x01
+                    ti_flag = (pd_ti >> 7) & 0x01
 
                     if cp_msg_type == 0x04:  # CP-ACK
                         logger.info(f"Received CP-ACK from IMSI: {imsi}, TI={ti_value}, TI-flag={ti_flag}")
@@ -506,7 +506,7 @@ class SMSCService:
                                     else:
                                         logger.warning(f"RP-ACK from {imsi} but no acknowledged message found")
 
-                                    cp_ack = create_cp_ack(ti_value)
+                                    cp_ack = create_cp_ack(ti_value, ti_flag=1 - ti_flag)
                                     sgsap_msg = create_downlink_unitdata(imsi, cp_ack)
                                     self._send_to_mme(mme, sgsap_msg)
                                     logger.info(f"Sent CP-ACK to IMSI: {imsi}")
@@ -516,12 +516,18 @@ class SMSCService:
                                         rp_cause = rp_msg[2]
                                         logger.warning(f"RP-ERROR from IMSI: {imsi}, cause: {rp_cause}")
 
-                                    cp_ack = create_cp_ack(ti_value)
+                                    cp_ack = create_cp_ack(ti_value, ti_flag=1 - ti_flag)
                                     sgsap_msg = create_downlink_unitdata(imsi, cp_ack)
                                     self._send_to_mme(mme, sgsap_msg)
 
                                 elif rp_msg_type == 0x00:  # RP-DATA (MS→Network, MO-SMS)
                                     logger.info(f"Received RP-DATA (MO) from IMSI: {imsi}")
+
+                                    # First, send CP-ACK to acknowledge the received CP-DATA
+                                    cp_ack = create_cp_ack(ti_value, ti_flag=1 - ti_flag)
+                                    sgsap_msg = create_downlink_unitdata(imsi, cp_ack)
+                                    self._send_to_mme(mme, sgsap_msg)
+                                    logger.info(f"Sent CP-ACK to IMSI: {imsi}")
 
                                     try:
                                         offset = 2
@@ -557,12 +563,13 @@ class SMSCService:
                                         import traceback
                                         traceback.print_exc()
 
+                                    # Now send CP-DATA containing RP-ACK
                                     rp_ref = rp_msg[1] if len(rp_msg) > 1 else 0
                                     rp_ack = bytes([0x03, rp_ref])
-                                    cp_data_response = create_cp_data(rp_ack, ti_value)
+                                    cp_data_response = create_cp_data(rp_ack, ti_value, ti_flag=1)
                                     sgsap_msg = create_downlink_unitdata(imsi, cp_data_response)
                                     self._send_to_mme(mme, sgsap_msg)
-                                    logger.info(f"Sent RP-ACK to IMSI: {imsi}")
+                                    logger.info(f"Sent RP-ACK (in CP-DATA) to IMSI: {imsi}")
 
                                 else:
                                     logger.info(f"Received RP type 0x{rp_msg_type:02x} from IMSI: {imsi}")

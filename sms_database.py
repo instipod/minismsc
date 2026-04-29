@@ -132,7 +132,7 @@ class SMSDatabase:
         with self._get_conn() as conn:
             conn.execute("""
                 UPDATE messages
-                SET ti = ?, last_attempt_at = ?, retry_count = retry_count + 1
+                SET ti = ?, last_attempt_at = ?, retry_count = retry_count + 1, status = 'retrying'
                 WHERE guid = ?
             """, (ti, time.time(), guid))
 

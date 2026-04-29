@@ -215,21 +215,22 @@ def create_rp_data_dl(destination: str, tpdu: bytes, reference: int = 0, smsc_ad
     return bytes(rp_data)
 
 
-def create_cp_data(rp_message: bytes, ti: int = 0) -> bytes:
+def create_cp_data(rp_message: bytes, ti: int = 0, ti_flag: int = 0) -> bytes:
     """
     Create CP-DATA message - wraps RP-DATA for NAS transport
 
     Args:
         rp_message: RP-DATA message
         ti: Transaction Identifier (0-6)
+        ti_flag: TI flag (0=originating, 1=responding)
 
     Returns:
         Complete CP-DATA message (NAS message)
     """
     cp_data = bytearray()
 
-    # Protocol Discriminator: SMS (0x09) + Transaction ID
-    pd_ti = 0x09 | ((ti & 0x07) << 4)
+    # Protocol Discriminator: SMS (0x09) + Transaction ID + TI flag
+    pd_ti = 0x09 | ((ti & 0x07) << 4) | ((ti_flag & 0x01) << 7)
     cp_data.append(pd_ti)
 
     # Message Type: CP-DATA = 0x01
@@ -242,22 +243,21 @@ def create_cp_data(rp_message: bytes, ti: int = 0) -> bytes:
     return bytes(cp_data)
 
 
-def create_cp_ack(ti: int = 0) -> bytes:
+def create_cp_ack(ti: int = 0, ti_flag: int = 1) -> bytes:
     """
     Create CP-ACK message - acknowledges CP-DATA receipt
 
     Args:
         ti: Transaction Identifier (must match the CP-DATA being acknowledged)
-            TI flag should be set to 1 (responding to peer-allocated TI)
+        ti_flag: TI flag (0=we allocated TI, 1=responding to peer-allocated TI)
 
     Returns:
         Complete CP-ACK message (NAS message)
     """
     cp_ack = bytearray()
 
-    # Protocol Discriminator: SMS (0x09) + Transaction ID with TI flag = 1
-    # TI flag (bit 4) = 1 means responding to peer-allocated TI
-    pd_ti = 0x09 | ((ti & 0x07) << 4) | 0x08
+    # Protocol Discriminator: SMS (0x09) + Transaction ID + TI flag
+    pd_ti = 0x09 | ((ti & 0x07) << 4) | ((ti_flag & 0x01) << 7)
     cp_ack.append(pd_ti)
 
     # Message Type: CP-ACK = 0x04
