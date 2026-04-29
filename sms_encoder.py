@@ -264,3 +264,176 @@ def create_cp_ack(ti: int = 0) -> bytes:
     cp_ack.append(0x04)
 
     return bytes(cp_ack)
+
+
+def decode_address(data: bytes, offset: int = 0) -> tuple[str, int]:
+    """
+    Decode phone number from semi-octet format
+
+    Args:
+        data: Byte array containing the address
+        offset: Starting offset in the data
+
+    Returns:
+        Tuple of (phone_number, bytes_consumed)
+    """
+    if len(data) <= offset:
+        return "", 0
+
+    length = data[offset]  # Length in digits
+    if length == 0:
+        return "", 1
+
+    if len(data) <= offset + 1:
+        return "", 1
+
+    addr_type = data[offset + 1]
+
+    # Calculate number of octets for the digits
+    num_octets = (length + 1) // 2
+
+    if len(data) < offset + 2 + num_octets:
+        return "", 2
+
+    # Decode semi-octets
+    number = ""
+    for i in range(num_octets):
+        if offset + 2 + i >= len(data):
+            break
+        octet = data[offset + 2 + i]
+        d1 = octet & 0x0F
+        d2 = (octet >> 4) & 0x0F
+
+        if d1 <= 9:
+            number += str(d1)
+        if d2 <= 9 and len(number) < length:
+            number += str(d2)
+
+    # Add + prefix for international numbers
+    if addr_type == 0x91:
+        number = "+" + number
+
+    return number, 2 + num_octets
+
+
+def decode_gsm7(data: bytes, length: int) -> str:
+    """
+    Decode GSM 7-bit default alphabet
+
+    Args:
+        data: Packed 7-bit data
+        length: Number of septets (characters)
+
+    Returns:
+        Decoded text string
+    """
+    gsm7_basic = (
+        "@£$¥èéùìòÇ\nØø\rÅåΔ_ΦΓΛΩΠΨΣΘΞ\x1bÆæßÉ !\"#¤%&'()*+,-./0123456789:;<=>?"
+        "¡ABCDEFGHIJKLMNOPQRSTUVWXYZÄÖÑÜ§¿abcdefghijklmnopqrstuvwxyzäöñüà"
+    )
+
+    result = []
+    bits = 0
+    bit_count = 0
+
+    for byte_val in data:
+        bits |= (byte_val << bit_count)
+        bit_count += 8
+
+        while bit_count >= 7 and len(result) < length:
+            char_code = bits & 0x7F
+            bits >>= 7
+            bit_count -= 7
+
+            if char_code < len(gsm7_basic):
+                result.append(gsm7_basic[char_code])
+            else:
+                result.append('?')
+
+    return ''.join(result)
+
+
+def decode_sms_submit(tpdu: bytes) -> Optional[dict]:
+    """
+    Decode an SMS-SUBMIT TPDU (mobile-originated SMS)
+
+    Args:
+        tpdu: SMS-SUBMIT TPDU bytes
+
+    Returns:
+        Dictionary with decoded fields or None if parsing fails
+    """
+    try:
+        if len(tpdu) < 2:
+            return None
+
+        offset = 0
+
+        # First byte: TP-MTI, TP-RD, TP-VPF, TP-SRR, TP-UDHI, TP-RP
+        first_byte = tpdu[offset]
+        offset += 1
+
+        tp_mti = first_byte & 0x03
+        if tp_mti != 0x01:  # Must be SMS-SUBMIT
+            return None
+
+        tp_vpf = (first_byte >> 3) & 0x03  # Validity Period Format
+        tp_udhi = (first_byte >> 6) & 0x01  # User Data Header Indicator
+
+        # TP-MR (Message Reference)
+        if offset >= len(tpdu):
+            return None
+        msg_ref = tpdu[offset]
+        offset += 1
+
+        # TP-DA (Destination Address)
+        if offset >= len(tpdu):
+            return None
+        destination, da_len = decode_address(tpdu, offset)
+        offset += da_len
+
+        # TP-PID (Protocol Identifier)
+        if offset >= len(tpdu):
+            return None
+        tp_pid = tpdu[offset]
+        offset += 1
+
+        # TP-DCS (Data Coding Scheme)
+        if offset >= len(tpdu):
+            return None
+        tp_dcs = tpdu[offset]
+        offset += 1
+
+        # TP-VP (Validity Period) - optional based on TP-VPF
+        if tp_vpf == 0x02:  # Relative format
+            offset += 1
+        elif tp_vpf == 0x03:  # Absolute format
+            offset += 7
+
+        # TP-UDL (User Data Length)
+        if offset >= len(tpdu):
+            return None
+        udl = tpdu[offset]
+        offset += 1
+
+        # TP-UD (User Data)
+        user_data = tpdu[offset:]
+
+        # Decode based on DCS
+        encoding = tp_dcs & 0x0C
+        if encoding == 0x00:  # GSM7
+            text = decode_gsm7(user_data, udl)
+        elif encoding == 0x08:  # UCS2
+            text = user_data[:udl].decode('utf-16-be', errors='replace')
+        else:  # 8-bit or other
+            text = user_data[:udl].decode('latin-1', errors='replace')
+
+        return {
+            'message_reference': msg_ref,
+            'destination': destination,
+            'text': text,
+            'encoding': encoding,
+        }
+
+    except Exception as e:
+        return None

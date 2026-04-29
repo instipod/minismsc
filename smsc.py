@@ -19,7 +19,10 @@ from sgsap_protocol import (
     create_imsi_detach_ack, create_eps_detach_ack,
     decode_imsi, decode_location_area_id
 )
-from sms_encoder import create_sms_deliver_pdu, create_rp_data_dl, create_cp_data, create_cp_ack
+from sms_encoder import (
+    create_sms_deliver_pdu, create_rp_data_dl, create_cp_data, create_cp_ack,
+    decode_sms_submit
+)
 from sms_database import SMSDatabase
 
 
@@ -545,7 +548,7 @@ class SMSCService:
                                                 if tp_mti == 0x02:
                                                     self._handle_status_report(imsi, tpdu)
                                                 elif tp_mti == 0x01:
-                                                    logger.info(f"  → MO-SMS (SMS-SUBMIT) from {imsi}")
+                                                    self._handle_mo_sms(imsi, tpdu)
                                                 else:
                                                     logger.info(f"  → Unknown TPDU MTI=0x{tp_mti:02x}")
 
@@ -601,6 +604,30 @@ class SMSCService:
 
         except Exception as e:
             logger.error(f"Error parsing STATUS-REPORT: {e}")
+
+    def _handle_mo_sms(self, imsi: str, tpdu: bytes):
+        """Handle SMS-SUBMIT (MO-SMS) from UE."""
+        try:
+            sms_data = decode_sms_submit(tpdu)
+            if sms_data:
+                logger.info(f"📱 RECEIVED SMS from IMSI: {imsi}")
+                logger.info(f"   Destination: {sms_data['destination']}")
+                logger.info(f"   Message: {sms_data['text']}")
+                print(f"\n{'='*60}")
+                print(f"📱 INCOMING SMS")
+                print(f"{'='*60}")
+                print(f"From IMSI: {imsi}")
+                print(f"To: {sms_data['destination']}")
+                print(f"Message: {sms_data['text']}")
+                print(f"{'='*60}\n")
+            else:
+                logger.warning(f"Failed to decode MO-SMS from IMSI: {imsi}")
+                logger.info(f"  TPDU: {tpdu.hex()}")
+
+        except Exception as e:
+            logger.error(f"Error handling MO-SMS: {e}")
+            import traceback
+            traceback.print_exc()
 
     # ------------------------------------------------------------------
     # Retry / cleanup
